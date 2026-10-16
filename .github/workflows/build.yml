@@ -108,7 +108,6 @@ jobs:
           import net.minecraft.world.item.BlockItem;
           import net.minecraft.world.item.CreativeModeTabs;
           import net.minecraft.world.level.block.entity.BlockEntityType;
-          import net.minecraft.world.level.block.state.BlockBehaviour;
           import net.minecraft.world.level.material.MapColor;
           import net.neoforged.bus.api.IEventBus;
           import net.neoforged.fml.common.Mod;
@@ -131,7 +130,7 @@ jobs:
               public static final DeferredBlock<LavaGeneratorBlock> LAVA_GENERATOR = BLOCKS.registerBlock(
                       "lava_generator",
                       LavaGeneratorBlock::new,
-                      BlockBehaviour.Properties.of()
+                      props -> props
                               .mapColor(MapColor.STONE)
                               .strength(3.5F)
                               .requiresCorrectToolForDrops()
@@ -229,6 +228,215 @@ jobs:
               // Right-click with a lava bucket (fill) or an empty bucket (take lava back)
               @Override
               protected InteractionResult useItemOn(ItemStack stack, BlockState state, Level level, BlockPos pos,
+                                                    Player player, InteractionHand hand, BlockHitResult hit) {
+                  boolean lavaBucket = stack.is(Items.LAVA_BUCKET);
+                  boolean emptyBucket = stack.is(Items.BUCKET);
+                  if (!lavaBucket && !emptyBucket) {
+                      return InteractionResult.TRY_WITH_EMPTY_HAND;
+                  }
+                  if (!level.isClientSide() && level.getBlockEntity(pos) instanceof LavaGeneratorBlockEntity be) {
+                      if (lavaBucket && be.addLavaBucket()) {
+                          if (!player.hasInfiniteMaterials()) {
+                              player.setItemInHand(hand, ItemUtils.createFilledResult(stack, player, new ItemStack(Items.BUCKET)));
+                          }
+                          level.playSound(null, pos, SoundEvents.BUCKET_EMPTY_LAVA, SoundSource.BLOCKS, 1.0F, 1.0F);
+                      } else if (emptyBucket && be.takeLavaBucket()) {
+                          if (!player.hasInfiniteMaterials()) {
+                              player.setItemInHand(hand, ItemUtils.createFilledResult(stack, player, new ItemStack(Items.LAVA_BUCKET)));
+                          }
+                          level.playSound(null, pos, SoundEvents.BUCKET_FILL_LAVA, SoundSource.BLOCKS, 1.0F, 1.0F);
+                      }
+                  }
+                  return InteractionResult.SUCCESS;
+              }
+
+              // Right-click with anything else: open the GUI
+              @Override
+              protected InteractionResult useWithoutItem(BlockState state, Level level, BlockPos pos, Player player, BlockHitResult hit) {
+                  if (!level.isClientSide() && player instanceof ServerPlayer serverPlayer
+                          && level.getBlockEntity(pos) instanceof LavaGeneratorBlockEntity be) {
+                      serverPlayer.openMenu(be);
+                  }
+                  return InteractionResult.SUCCESS;
+              }
+          }
+          __EOF__
+          mkdir -p src/main/java/com/badtothebonejjc/lavagenerator
+          cat > src/main/java/com/badtothebonejjc/lavagenerator/LavaGeneratorBlockEntity.java <<'__EOF__'
+          package com.badtothebonejjc.lavagenerator;
+
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.Direction;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.world.MenuProvider;
+          import net.minecraft.world.entity.player.Inventory;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.inventory.AbstractContainerMenu;
+          import net.minecraft.world.inventory.ContainerData;
+          import net.minecraft.world.inventory.ContainerLevelAccess;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.level.block.entity.BlockEntity;
+          import net.minecraft.world.level.block.state.BlockState;
+          import net.minecraft.world.level.material.Fluids;
+          import net.minecraft.world.level.storage.ValueInput;
+          import net.minecraft.world.level.storage.ValueOutput;
+          import net.neoforged.neoforge.capabilities.Capabilities;
+          import net.neoforged.neoforge.transfer.energy.EnergyHandler;
+          import net.neoforged.neoforge.transfer.energy.SimpleEnergyHandler;
+          import net.neoforged.neoforge.transfer.fluid.FluidResource;
+          import net.neoforged.neoforge.transfer.fluid.FluidStacksResourceHandler;
+          import net.neoforged.neoforge.transfer.transaction.Transaction;
+
+          public class LavaGeneratorBlockEntity extends BlockEntity implements MenuProvider {
+              public static final int TANK_CAPACITY = 10000;   // mB (10 buckets)
+              public static final int ENERGY_CAPACITY = 200000; // FE
+              public static final int FE_PER_MB = 20;          // 1 bucket = 20,000 FE
+              public static final int BURN_PER_TICK = 10;      // mB burned per tick = 200 FE/t
+              public static final int OUTPUT_PER_TICK = 1000;  // max FE pushed per side per tick
+
+              // Tank only accepts lava
+              private final FluidStacksResourceHandler tank = new FluidStacksResourceHandler(1, TANK_CAPACITY) {
+                  @Override
+                  public boolean isValid(int index, FluidResource resource) {
+                      return resource.getFluid() == Fluids.LAVA;
+                  }
+              };
+
+              private final SimpleEnergyHandler energy = new SimpleEnergyHandler(ENERGY_CAPACITY);
+
+              // Synced to the GUI: 0 = lava (mB), 1 = energy (FE)
+              private final ContainerData data = new ContainerData() {
+                  @Override
+                  public int get(int index) {
+                      return switch (index) {
+                          case 0 -> lavaAmount();
+                          case 1 -> energy.getAmountAsInt();
+                          default -> 0;
+                      };
+                  }
+
+                  @Override
+                  public void set(int index, int value) {
+                  }
+
+                  @Override
+                  public int getCount() {
+                      return 2;
+                  }
+              };
+
+              public LavaGeneratorBlockEntity(BlockPos pos, BlockState state) {
+                  super(LavaGenerator.LAVA_GENERATOR_BE.get(), pos, state);
+              }
+
+              public EnergyHandler getEnergy() {
+                  return energy;
+              }
+
+              public FluidStacksResourceHandler getTank() {
+                  return tank;
+              }
+
+              private int lavaAmount() {
+                  return tank.getAmountAsInt(0);
+              }
+
+              public boolean addLavaBucket() {
+                  try (Transaction tx = Transaction.openRoot()) {
+                      int inserted = tank.insert(FluidResource.of(Fluids.LAVA), 1000, tx);
+                      if (inserted == 1000) {
+                          tx.commit();
+                          setChanged();
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              public boolean takeLavaBucket() {
+                  try (Transaction tx = Transaction.openRoot()) {
+                      int extracted = tank.extract(FluidResource.of(Fluids.LAVA), 1000, tx);
+                      if (extracted == 1000) {
+                          tx.commit();
+                          setChanged();
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              public void serverTick(Level level, BlockPos pos, BlockState state) {
+                  boolean changed = false;
+
+                  // 1) Burn lava -> FE
+                  int space = ENERGY_CAPACITY - energy.getAmountAsInt();
+                  int burn = Math.min(Math.min(BURN_PER_TICK, lavaAmount()), space / FE_PER_MB);
+                  if (burn > 0) {
+                      try (Transaction tx = Transaction.openRoot()) {
+                          int drained = tank.extract(FluidResource.of(Fluids.LAVA), burn, tx);
+                          int made = drained * FE_PER_MB;
+                          if (drained > 0 && energy.insert(made, tx) == made) {
+                              tx.commit();
+                              changed = true;
+                          }
+                      }
+                  }
+
+                  // 2) Push FE into neighbouring blocks (cables, machines, batteries)
+                  for (Direction dir : Direction.values()) {
+                      int stored = energy.getAmountAsInt();
+                      if (stored <= 0) {
+                          break;
+                      }
+                      BlockPos neighborPos = pos.relative(dir);
+                      if (level.getBlockEntity(neighborPos) instanceof LavaGeneratorBlockEntity) {
+                          continue;
+                      }
+                      EnergyHandler target = level.getCapability(Capabilities.Energy.BLOCK, neighborPos, dir.getOpposite());
+                      if (target == null) {
+                          continue;
+                      }
+                      try (Transaction tx = Transaction.openRoot()) {
+                          int accepted = target.insert(Math.min(stored, OUTPUT_PER_TICK), tx);
+                          if (accepted > 0 && energy.extract(accepted, tx) == accepted) {
+                              tx.commit();
+                              changed = true;
+                          }
+                      }
+                  }
+
+                  if (changed) {
+                      setChanged();
+                  }
+              }
+
+              // ---- save / load ----
+
+              @Override
+              protected void saveAdditional(ValueOutput output) {
+                  super.saveAdditional(output);
+                  output.putInt("Lava", lavaAmount());
+                  output.putInt("Energy", energy.getAmountAsInt());
+              }
+
+              @Override
+              protected void loadAdditional(ValueInput input) {
+                  super.loadAdditional(input);
+                  setStored(input.getIntOr("Lava", 0), input.getIntOr("Energy", 0));
+              }
+
+              private void setStored(int lava, int fe) {
+                  try (Transaction tx = Transaction.openRoot()) {
+                      int currentLava = lavaAmount();
+                      if (currentLava > 0) {
+                          tank.extract(FluidResource.of(Fluids.LAVA), currentLava, tx);
+                      }
+                      if (lava > 0) {
+                          tank.insert(FluidResource.of(Fluids.LAVA), Math.min(lava, TANK_CAPACITY), tx);
+                      }
+                      int currentEnergy = energy.getAmountAsInt();
+                      if (currentEnergy > 0) {
+                          energy.extrionResult useItemOn(ItemStack stack, BlockState state, Level level, BlockPos pos,
                                                     Player player, InteractionHand hand, BlockHitResult hit) {
                   boolean lavaBucket = stack.is(Items.LAVA_BUCKET);
                   boolean emptyBucket = stack.is(Items.BUCKET);
